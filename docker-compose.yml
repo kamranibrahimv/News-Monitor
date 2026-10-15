@@ -1,0 +1,11 @@
+services:
+  monitor:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      - "127.0.0.1:8000:8000"
+    volumes:
+      - monitor_data:/data
+volumes:
+  monitor_data:
