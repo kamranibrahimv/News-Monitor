@@ -2,7 +2,7 @@ import os, json, sqlite3, asyncio, html, secrets
 from datetime import datetime, timezone
 from pathlib import Path
 from contextlib import asynccontextmanager
-from urllib.parse import urlparse
+from urllib.parse import urlparse, quote
 import feedparser, httpx
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from dotenv import load_dotenv
@@ -31,6 +31,7 @@ def setup():
         c.execute('CREATE TABLE IF NOT EXISTS articles (id INTEGER PRIMARY KEY, url TEXT UNIQUE, title TEXT, source TEXT, published TEXT, discovered TEXT, matched INTEGER DEFAULT 0)')
         c.execute('CREATE TABLE IF NOT EXISTS keywords (term TEXT PRIMARY KEY)')
         c.execute('CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)')
+        c.execute('CREATE TABLE IF NOT EXISTS subscribers (chat_id TEXT PRIMARY KEY)')
         defaults=['DSMF','Dövlət Sosial Müdafiə Fondu','Dövlət Sosial Müdafiə Fondunun','pensiya','pensiyalar','pensiyaçı','pensiya kapitalı','pensiya ödənişi','pensiya artımı','müavinət','sosial müavinət','sosial yardım','ünvanlı dövlət sosial yardımı','sosial sığorta']
         for term in defaults:
             c.execute('INSERT OR IGNORE INTO keywords(term) VALUES(?)',(term,))
@@ -40,11 +41,16 @@ def authorized(request):
         raise HTTPException(401,'Invalid or missing X-Admin-Token')
 
 async def notify(client,title,url,source):
-    if not BOT or not CHAT: return
+    if not BOT: return
+    with connect() as c:
+        chats=[r[0] for r in c.execute("SELECT chat_id FROM subscribers")]
+    if CHAT and CHAT not in chats: chats.append(CHAT)
+    if not chats: return
     message=f'📰 {title}\nMənbə: {source}\n{url}'
     try:
-        r=await client.post(f'https://api.telegram.org/bot{BOT}/sendMessage',json={'chat_id':CHAT,'text':message[:4000],'disable_web_page_preview':True},timeout=15)
-        r.raise_for_status()
+        for chat_id in chats:
+            r=await client.post(f'https://api.telegram.org/bot{BOT}/sendMessage',json={'chat_id':chat_id,'text':message[:4000],'disable_web_page_preview':True},timeout=15)
+            r.raise_for_status()
     except Exception as e: print('Telegram error:',repr(e))
 
 def safe_link(link):
@@ -59,6 +65,9 @@ async def scan():
         with connect() as c:
             terms=[r['term'].casefold() for r in c.execute('SELECT term FROM keywords')]
         sources=json.loads(SOURCES.read_text(encoding='utf-8'))
+        # Google News RSS search gives coverage beyond individual RSS endpoints.
+        for query in ['DSMF', 'pensiya Azərbaycan', 'sosial müavinət Azərbaycan', 'Dövlət Sosial Müdafiə Fondu']:
+            sources.append({'name':'Google News: '+query,'url':'https://news.google.com/rss/search?q='+quote(query)+'&hl=az&gl=AZ&ceid=AZ:az'})
         added=matched=errors=0
         async with httpx.AsyncClient(follow_redirects=True,timeout=20,headers={'User-Agent':'NewsMonitor/1.0 (RSS reader)'}) as client:
             for source in sources:
@@ -68,7 +77,7 @@ async def scan():
                     resp=await client.get(url)
                     resp.raise_for_status()
                     feed=feedparser.parse(resp.content)
-                    if not feed.entries and feed.bozo: raise ValueError('Invalid or empty RSS feed')
+                    if not feed.entries: raise ValueError('Empty or invalid RSS feed')
                     for item in feed.entries[:100]:
                         title=str(item.get('title','')).strip()
                         link=str(item.get('link','')).strip()
@@ -89,13 +98,54 @@ async def scan():
                     print('Source error',source.get('name'),repr(e))
         return {'new':added,'matched':matched,'source_errors':errors,'checked_at':datetime.now(timezone.utc).isoformat()}
 
+async def telegram_poll():
+    """Long-poll Telegram; /start automatically registers the user's chat ID."""
+    offset=None
+    async with httpx.AsyncClient(timeout=40) as client:
+        while True:
+            try:
+                payload={'timeout':25,'allowed_updates':['message']}
+                if offset is not None: payload['offset']=offset
+                response=await client.get(f'https://api.telegram.org/bot{BOT}/getUpdates',params=payload)
+                response.raise_for_status()
+                data=response.json()
+                if not data.get('ok'):
+                    print('Telegram polling rejected:',data.get('description')); await asyncio.sleep(10); continue
+                for update in data.get('result',[]):
+                    offset=update['update_id']+1
+                    message=update.get('message') or {}
+                    chat=message.get('chat') or {}
+                    chat_id=chat.get('id')
+                    command=str(message.get('text') or '').split(' ')[0].split('@')[0].lower()
+                    if chat_id is None: continue
+                    if command=='/start':
+                        with connect() as c:
+                            c.execute('INSERT OR IGNORE INTO subscribers(chat_id) VALUES(?)',(str(chat_id),))
+                        reply='✅ DSMF xəbər monitorinqinə qoşuldunuz. Yeni uyğun xəbərlər burada görünəcək. /stop — bildirişləri dayandır.'
+                    elif command=='/stop':
+                        with connect() as c:
+                            c.execute('DELETE FROM subscribers WHERE chat_id=?',(str(chat_id),))
+                        reply='Bildirişlər dayandırıldı. Yenidən qoşulmaq üçün /start yazın.'
+                    else: continue
+                    await client.post(f'https://api.telegram.org/bot{BOT}/sendMessage',json={'chat_id':chat_id,'text':reply},timeout=15)
+            except asyncio.CancelledError: raise
+            except Exception as exc:
+                print('Telegram polling error:',repr(exc))
+                await asyncio.sleep(10)
+
 @asynccontextmanager
 async def lifespan(app):
     setup()
     scheduler.add_job(scan,'interval',minutes=INTERVAL,id='scan',max_instances=1,coalesce=True)
     scheduler.start()
+    telegram_task=asyncio.create_task(telegram_poll()) if BOT else None
     try: yield
-    finally: scheduler.shutdown(wait=False)
+    finally:
+        if telegram_task:
+            telegram_task.cancel()
+            try: await telegram_task
+            except asyncio.CancelledError: pass
+        scheduler.shutdown(wait=False)
 
 app=FastAPI(title='AZ News Monitor',lifespan=lifespan)
 
