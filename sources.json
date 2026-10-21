@@ -1,7 +1,7 @@
 [
   {
     "name": "DSMF (rəsmi)",
-    "url": "https://dsmf.gov.az/az/media/xeberler",
+    "url": "https://www.dsmf.gov.az/az/media/xeberler",
     "type": "official_html"
   },
   {
@@ -14,7 +14,7 @@
   },
   {
     "name": "Əmək və Əhalinin Sosial Müdafiəsi Nazirliyi",
-    "url": "https://sosial.gov.az/az/media/xeberler",
+    "url": "https://www.sosial.gov.az/az",
     "type": "official_html"
   }
 ]
