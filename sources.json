@@ -1,5 +1,20 @@
 [
-  {"name":"Report.az", "url":"https://report.az/rss/"},
-  {"name":"APA", "url":"https://apa.az/az/rss"},
-  {"name":"Trend", "url":"https://az.trend.az/feeds/index.rss"}
+  {
+    "name": "DSMF (rəsmi)",
+    "url": "https://dsmf.gov.az/az/media/xeberler",
+    "type": "official_html"
+  },
+  {
+    "name": "Report.az",
+    "url": "https://report.az/rss/"
+  },
+  {
+    "name": "Trend",
+    "url": "https://az.trend.az/feeds/index.rss"
+  },
+  {
+    "name": "Əmək və Əhalinin Sosial Müdafiəsi Nazirliyi",
+    "url": "https://sosial.gov.az/az/media/xeberler",
+    "type": "official_html"
+  }
 ]
