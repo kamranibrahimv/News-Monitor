@@ -6,6 +6,7 @@ from pathlib import Path
 from contextlib import asynccontextmanager
 from urllib.parse import urlparse, quote
 import feedparser, httpx
+from official_sources import collect_official
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request, HTTPException
@@ -100,39 +101,49 @@ async def scan():
         # Only publisher-operated RSS feeds. Google News can relist old articles
         # with a fresh aggregator timestamp, which is not proof of publication today.
         sources=[source for source in sources if 'news.google.com' not in source.get('url','')]
-        added=matched=errors=sent=failed=0
+        added=matched=errors=sent=failed=checked=0
+        source_stats=[]
         async with httpx.AsyncClient(follow_redirects=True,timeout=20,headers={'User-Agent':'NewsMonitor/1.0 (RSS reader)'}) as client:
             for source in sources:
                 try:
-                    url=source['url']
-                    if not safe_link(url): continue
-                    resp=await client.get(url)
-                    resp.raise_for_status()
-                    feed=feedparser.parse(resp.content)
-                    if not feed.entries:
-                        print('Skipping empty RSS feed:',source.get('name'),flush=True)
-                        continue
-                    for item in feed.entries[:100]:
+                    if not safe_link(source['url']): continue
+                    if source.get('type') == 'official_html':
+                        entries=await collect_official(client,source,datetime.now(BAKU).date())
+                    else:
+                        resp=await client.get(source['url'])
+                        resp.raise_for_status()
+                        feed=feedparser.parse(resp.content)
+                        entries=feed.entries[:100]
+                        if not entries:
+                            print('Skipping empty RSS feed:',source.get('name'),flush=True)
+                    count=0
+                    for item in entries:
                         title=str(item.get('title','')).strip()
                         link=str(item.get('link','')).strip()
                         if not title or not safe_link(link): continue
-                        if not today_published(item): continue
+                        if source.get('type') != 'official_html' and not today_published(item): continue
+                        count+=1
                         summary=str(item.get('summary',''))
                         is_match=bool(terms) and any(t in (title+' '+summary).casefold() for t in terms)
                         published=str(item.get('published',''))
                         with connect() as c:
                             cur=c.execute('INSERT OR IGNORE INTO articles(url,title,source,published,discovered,matched) VALUES(?,?,?,?,?,?)',(link,title,source['name'],published,datetime.now(timezone.utc).isoformat(),int(is_match)))
                             is_new=cur.rowcount>0
+                            if is_match:
+                                c.execute('UPDATE articles SET matched=1 WHERE url=?',(link,))
                         if is_new: added+=1
                         if is_match:
                             if is_new: matched+=1
                             result=await notify(client,title,link,source['name'])
                             sent+=result['sent']
                             failed+=result['failed']
+                    checked+=count
+                    source_stats.append({'source':source['name'],'today':count})
                 except Exception as e:
                     errors+=1
-                    print('Source error',source.get('name'),repr(e))
-        return {'new':added,'matched':matched,'source_errors':errors,'telegram_sent':sent,'telegram_failed':failed,'checked_at':datetime.now(timezone.utc).isoformat()}
+                    source_stats.append({'source':source.get('name'),'error':type(e).__name__})
+                    print('Source error',source.get('name'),repr(e),flush=True)
+        return {'new':added,'matched':matched,'source_errors':errors,'today_articles_checked':checked,'sources':source_stats,'telegram_sent':sent,'telegram_failed':failed,'checked_at':datetime.now(timezone.utc).isoformat()}
 
 async def telegram_poll():
     """Long-poll Telegram; /start automatically registers the user's chat ID."""
@@ -191,7 +202,7 @@ app=FastAPI(title='AZ News Monitor',lifespan=lifespan)
 
 @app.get('/',response_class=HTMLResponse)
 async def index():
-    return '''<!doctype html><html lang="az"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>AZ News Monitor</title><style>body{font:16px system-ui;background:#0c1323;color:#eef2ff;max-width:980px;margin:40px auto;padding:16px}input,button{padding:12px;border-radius:9px;border:1px solid #43506b;background:#1c2940;color:white}input{min-width:250px}button{cursor:pointer;background:#2563eb}article{padding:14px;border-bottom:1px solid #34405a}a{color:#8db8ff}small{color:#aab7d1}.row{display:flex;gap:8px;flex-wrap:wrap;margin:15px 0}</style><h1>📰 AZ News Monitor</h1><p>RSS əsaslı 5 dəqiqəlik monitorinq • DSMF, pensiya, müavinət və sosial yardım açar sözləri əvvəlcədən əlavə edilib.</p><div class="row"><input id="token" type="password" placeholder="ADMIN_TOKEN"><button onclick="save()">Daxil ol</button></div><div class="row"><input id="word" placeholder="Yeni açar söz"><button onclick="add()">Əlavə et</button><button onclick="scan()">İndi yoxla</button></div><p id="words"></p><p id="status"></p><h2>Bugünkü uyğun xəbərlər (Bakı vaxtı)</h2><div id="news"></div><script>let token=sessionStorage.getItem('t')||'';document.getElementById('token').value=token;function save(){token=document.getElementById('token').value;sessionStorage.setItem('t',token);load()}async function api(path,method='GET',data){let r=await fetch(path,{method,headers:{'X-Admin-Token':token,'Content-Type':'application/json'},body:data?JSON.stringify(data):undefined});if(!r.ok)throw Error('HTTP '+r.status);return r.json()}function esc(x){return String(x).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}async function load(){try{let [k,n]=await Promise.all([api('/api/keywords'),api('/api/articles')]);document.getElementById('words').innerHTML=k.map(w=>'<button data-word="'+esc(w)+'" class="remove">'+esc(w)+' ×</button>').join(' ')||'Açar söz yoxdur';document.querySelectorAll('.remove').forEach(b=>b.onclick=()=>del(b.dataset.word));document.getElementById('news').innerHTML=n.map(a=>'<article><a href="'+esc(a.url)+'" target="_blank" rel="noopener noreferrer">'+esc(a.title)+'</a><p><small>'+esc(a.source)+' • '+esc(a.discovered)+'</small></p></article>').join('')||'Hələ uyğun xəbər yoxdur';document.getElementById('status').textContent='Panel aktivdir'}catch(e){document.getElementById('status').textContent='Xəta: '+e.message}}async function add(){let term=document.getElementById('word').value.trim();if(!term)return;await api('/api/keywords','POST',{term});document.getElementById('word').value='';load()}async function del(term){await api('/api/keywords','DELETE',{term});load()}async function scan(){document.getElementById('status').textContent='Yoxlanılır...';try{let r=await api('/api/scan','POST');document.getElementById('status').textContent=JSON.stringify(r);load()}catch(e){alert(e.message)}}if(token)load();</script></html>'''
+    return '''<!doctype html><html lang="az"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>AZ News Monitor</title><style>body{font:16px system-ui;background:#0c1323;color:#eef2ff;max-width:980px;margin:40px auto;padding:16px}input,button{padding:12px;border-radius:9px;border:1px solid #43506b;background:#1c2940;color:white}input{min-width:250px}button{cursor:pointer;background:#2563eb}article{padding:14px;border-bottom:1px solid #34405a}a{color:#8db8ff}small{color:#aab7d1}.row{display:flex;gap:8px;flex-wrap:wrap;margin:15px 0}</style><h1>📰 AZ News Monitor</h1><p>RSS əsaslı 5 dəqiqəlik monitorinq • DSMF, pensiya, müavinət və sosial yardım açar sözləri əvvəlcədən əlavə edilib.</p><div class="row"><input id="token" type="password" placeholder="ADMIN_TOKEN"><button onclick="save()">Daxil ol</button></div><div class="row"><input id="word" placeholder="Yeni açar söz"><button onclick="add()">Əlavə et</button><button onclick="scan()">İndi yoxla</button></div><p id="words"></p><p id="status"></p><h2>Bugünkü uyğun xəbərlər (Bakı vaxtı)</h2><div id="news"></div><script>let token=sessionStorage.getItem('t')||'';document.getElementById('token').value=token;function save(){token=document.getElementById('token').value;sessionStorage.setItem('t',token);load()}async function api(path,method='GET',data){let r=await fetch(path,{method,headers:{'X-Admin-Token':token,'Content-Type':'application/json'},body:data?JSON.stringify(data):undefined});if(!r.ok)throw Error('HTTP '+r.status);return r.json()}function esc(x){return String(x).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}async function load(){try{let [k,n]=await Promise.all([api('/api/keywords'),api('/api/articles')]);document.getElementById('words').innerHTML=k.map(w=>'<button data-word="'+esc(w)+'" class="remove">'+esc(w)+' ×</button>').join(' ')||'Açar söz yoxdur';document.querySelectorAll('.remove').forEach(b=>b.onclick=()=>del(b.dataset.word));document.getElementById('news').innerHTML=n.map(a=>'<article><a href="'+esc(a.url)+'" target="_blank" rel="noopener noreferrer">'+esc(a.title)+'</a><p><small>'+esc(a.source)+' • '+esc(a.discovered)+'</small></p></article>').join('')||'Hələ uyğun xəbər yoxdur';if(!document.getElementById('status').textContent.startsWith('{'))document.getElementById('status').textContent='Panel aktivdir'}catch(e){document.getElementById('status').textContent='Xəta: '+e.message}}async function add(){let term=document.getElementById('word').value.trim();if(!term)return;await api('/api/keywords','POST',{term});document.getElementById('word').value='';load()}async function del(term){await api('/api/keywords','DELETE',{term});load()}async function scan(){document.getElementById('status').textContent='Yoxlanılır...';try{let r=await api('/api/scan','POST');document.getElementById('status').textContent=JSON.stringify(r);load()}catch(e){alert(e.message)}}if(token)load();</script></html>'''
 
 @app.get('/health')
 async def health(): return {'status':'ok','interval_minutes':INTERVAL}
@@ -225,7 +236,9 @@ async def articles(request:Request):
     result=[]
     for row in rows:
         try:
-            dt=parsedate_to_datetime(row['published'])
+            raw=row['published'] or ''
+            if raw==today.isoformat(): result.append(row); continue
+            dt=parsedate_to_datetime(raw)
             if dt.tzinfo and dt.astimezone(BAKU).date()==today: result.append(row)
         except (ValueError,TypeError,OverflowError): pass
     return result[:300]
